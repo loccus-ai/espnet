@@ -6,12 +6,18 @@ import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Collection, Dict, Iterable, List, Optional, Tuple, Union
+import subprocess
 
 import librosa
 import numpy as np
 import scipy.signal
 import soundfile
 from typeguard import typechecked
+
+import torch
+from torchaudio.io import AudioEffector
+from scipy.signal import butter, lfilter, filtfilt, ellip, bessel, cheby1, cheby2, sosfilt
+
 
 import espnet2.speechlm.definitions as speechlm_definitions
 from espnet2.layers.augmentation import DataAugmentation
@@ -21,6 +27,88 @@ from espnet2.text.hugging_face_token_id_converter import HuggingFaceTokenIDConve
 from espnet2.text.token_id_converter import TokenIDConverter
 from espnet2.text.whisper_token_id_converter import OpenAIWhisperTokenIDConverter
 from espnet2.text.whisper_tokenizer import OpenAIWhisperTokenizer
+
+def design_filter(btype, wn, fs, ftype, order=10, ripple=1, stopband_atts=40, output="sos"):
+    """
+    Designs a digital IIR filter using the specified filter type.
+
+    Parameters:
+    ----------
+    btype : str
+        The type of filter: 'lowpass', 'highpass', 'bandpass', or 'bandstop'.
+    wn : float or list of float
+        The critical frequency or frequencies (Hz). 
+        - If `btype` is 'lowpass' or 'highpass', `wn` is a single frequency.
+        - If `btype` is 'bandpass' or 'bandstop', `wn` is a list [low_cutoff, high_cutoff].
+    fs : float
+        The sampling frequency (Hz).
+    ftype : str
+        The filter design type. Supported values:
+        - 'butter'  : Butterworth filter (smooth response).
+        - 'cheby1'  : Chebyshev Type I filter (ripple in passband).
+        - 'cheby2'  : Chebyshev Type II filter (ripple in stopband).
+        - 'ellip'   : Elliptic filter (ripple in both bands, steepest roll-off).
+        - 'bessel'  : Bessel filter (best phase response, slow roll-off).
+    order : int, optional (default=10)
+        The filter order, which affects the sharpness of the cutoff.
+    ripple : float, optional (default=1)
+        The maximum ripple (dB) in the passband (only for 'cheby1' and 'ellip').
+    stopband_atts : float, optional (default=40)
+        The minimum attenuation (dB) in the stopband (only for 'cheby2' and 'ellip').
+
+    Returns:
+    -------
+    b, a : ndarray
+        Numerator (b) and denominator (a) coefficients of the IIR filter.
+
+    Raises:
+    ------
+    ValueError
+        If the specified filter type (`ftype`) is not implemented.
+
+    Example:
+    -------
+    # Design a Chebyshev Type II bandpass filter (300 Hz - 3400 Hz) for telephony
+    fs = 8000  # Sampling frequency
+    low_cut = 300
+    high_cut = 3400
+    order = 6
+    stopband_atts = 40
+    b, a = design_filter("bandpass", [low_cut, high_cut], fs, "cheby2", order=order, stopband_atts=stopband_atts)
+    """
+
+    if ftype=="butter":
+        s = butter(order, wn, btype=btype, fs=fs, output=output)
+    elif ftype== "cheby1":
+        s = cheby1(order, ripple, wn, btype=btype, fs=fs, output=output)
+    elif ftype== "cheby2":
+        s = cheby2(order, stopband_atts, wn, btype=btype, fs=fs, output=output)
+    elif ftype== "ellip":
+        s = ellip(order, ripple, stopband_atts, wn, btype=btype, fs=fs, output=output)
+    elif ftype== "bessel":
+        s = bessel(order, wn, btype=btype, fs=fs, output=output)
+    else:
+        raise ValueError(f"Filter type {ftype} not implemented")
+    return s
+
+def apply_filter(data, s, output="sos"):
+    """
+    Aplica un filtro diseñado a una señal.
+    
+    Parámetros:
+        data: Señal de entrada.
+        s: Coeficientes del filtro: sos or ba (s=[b,a])
+        
+    Retorna:
+        Señal filtrada.
+    """
+    if output=="ba":
+        y=filtfilt(s[0],s[1], data)
+    elif output=="sos":
+        y=sosfilt(s, data)
+    else:
+        raise ValueError(f"Filter output type {output} not implemented")
+    return y
 
 
 class AbsPreprocessor(ABC):
@@ -1992,6 +2080,609 @@ class SpkPreprocessor(CommonPreprocessor):
                             else:
                                 noises.append(sps[1])
                     self.noises.append(noises)
+
+    def __repr__(self):
+        name = self.__class__.__module__ + "." + self.__class__.__name__
+        msg = f"{name}(train={self.train}"
+        if self.spk2label:
+            msg += f", len(spk2label)={len(self.spk2label)}"
+        for key in ("target_duration", "sample_rate", "num_eval"):
+            if getattr(self, key):
+                msg += f", {key}={getattr(self, key)}"
+        if self.rirs is not None and self.rir_apply_prob > 0:
+            msg += f", rir_scp={self.rir_scp}, rir_apply_prob={self.rir_apply_prob}"
+        if self.noise_apply_prob > 0 and self.noises:
+            msg += f", noise_apply_prob={self.noise_apply_prob}"
+            msg += f", noises.shapes={[len(n) for n in self.noises]}"
+            msg += f", noise_probs={self.noise_probs}"
+            msg += f", noise_db_ranges={self.noise_db_ranges}"
+            msg += f", noise_num_to_mix={self.noise_num_to_mix}"
+        return msg + ")"
+
+    def _make_label_mapping(self):
+        label_idx = 0
+        self.spk2label = {}
+        for spk in self.spk2utt:
+            spk = spk.strip().split(" ")[0]
+            self.spk2label[spk] = label_idx
+            label_idx += 1
+
+    def _speech_process(self, data: Dict[np.ndarray, str]):
+        if self.train:
+            audio = data["speech"]
+
+            # duplicate if utt is shorter than minimum required duration
+            if len(audio) < self.target_duration:
+                shortage = self.target_duration - len(audio) + 1
+                audio = np.pad(audio, (0, shortage), "wrap")
+
+            startframe = np.array(
+                [np.int64(random.random() * (len(audio) - self.target_duration))]
+            )
+
+            data["speech"] = audio[
+                int(startframe) : int(startframe) + self.target_duration
+            ]
+
+            if self.noise_apply_prob > 0 or self.rir_apply_prob > 0:
+                data["speech"] = self._apply_data_augmentation(data["speech"])
+        else:
+            audio = data["speech"]
+            audio2 = data["speech2"]
+
+            # duplicate if utt is shorter than minimum required duration
+            if len(audio) < self.target_duration:
+                shortage = self.target_duration - len(audio) + 1
+                audio = np.pad(audio, (0, shortage), "wrap")
+            if len(audio2) < self.target_duration:
+                shortage = self.target_duration - len(audio2) + 1
+                audio2 = np.pad(audio2, (0, shortage), "wrap")
+
+            startframe = np.linspace(
+                0, len(audio) - self.target_duration, num=self.num_eval
+            )
+            audios = []
+            for frame in startframe:
+                audios.append(audio[int(frame) : int(frame) + self.target_duration])
+            audios = np.stack(audios, axis=0)
+
+            startframe2 = np.linspace(
+                0, len(audio2) - self.target_duration, num=self.num_eval
+            )
+            audios2 = []
+            for frame in startframe2:
+                audios2.append(audio2[int(frame) : int(frame) + self.target_duration])
+            audios2 = np.stack(audios2, axis=0)
+
+            data["speech"] = audios
+            data["speech2"] = audios2
+
+        return data
+
+    def _convolve_rir(self, speech, rirs):
+        rir_path = np.random.choice(rirs)
+        rir = None
+        if rir_path is not None:
+            rir, _ = soundfile.read(rir_path, dtype=np.float64, always_2d=True)
+
+            # rir: (Nmic, Time)
+            rir = rir.T
+
+            # normalize rir
+            rir = rir / np.sqrt(np.sum(rir**2))
+
+            # speech: (Nmic, Time)
+            # Note that this operation doesn't change the signal length
+            speech = scipy.signal.convolve(speech, rir, mode="full")[
+                :, : speech.shape[1]
+            ]
+        return speech, rir
+
+    def _load_noise(self, speech, speech_db, noises, noise_db_low, noise_db_high):
+        nsamples = speech.shape[1]
+        noise_path = np.random.choice(noises)
+        noise = None
+        if noise_path is not None:
+            noise_snr = np.random.uniform(noise_db_low, noise_db_high)
+            with soundfile.SoundFile(noise_path) as f:
+                if f.frames == nsamples:
+                    noise = f.read(dtype=np.float64)
+                elif f.frames < nsamples:
+                    # noise: (Time,)
+                    noise = f.read(dtype=np.float64)
+                    # Repeat noise
+                    noise = np.pad(
+                        noise,
+                        (0, nsamples - f.frames),
+                        mode="wrap",
+                    )
+                else:
+                    offset = np.random.randint(0, f.frames - nsamples)
+                    f.seek(offset)
+                    # noise: (Time,)
+                    noise = f.read(nsamples, dtype=np.float64)
+                    if len(noise) != nsamples:
+                        raise RuntimeError(f"Something wrong: {noise_path}")
+            # noise: (Nmic, Time)
+            noise = noise[None, :]
+
+            noise_power = np.mean(noise**2)
+            noise_db = 10 * np.log10(noise_power + 1e-4)
+            scale = np.sqrt(10 ** ((speech_db - noise_db - noise_snr) / 10))
+
+            noise = noise * scale
+        return noise
+
+    def _apply_data_augmentation(self, speech):
+        # speech: (Nmic, Time)
+        if speech.ndim == 1:
+            speech = speech[None, :]
+        else:
+            speech = speech.T
+
+        if self.rirs is not None and self.rir_apply_prob >= np.random.random():
+            speech, _ = self._convolve_rir(speech, self.rirs)
+
+        if self.noises and self.noise_apply_prob >= np.random.random():
+            idx = random.choices(
+                range(len(self.noises)), weights=self.noise_probs, k=1
+            )[0]
+            low, high = self.noise_num_to_mix[idx]
+            if low == high:
+                num_to_mix = low
+            else:
+                num_to_mix = np.random.randint(low, high + 1)
+
+            # add eps of 1e-4 to avoid negative value before log
+            speech_db = 10 * np.log10(np.mean(speech**2) + 1e-4)
+            noiselist = []
+            for _ in range(num_to_mix):
+                noise = self._load_noise(
+                    speech,  # original speech
+                    speech_db,  # db of speech
+                    self.noises[idx],  # a list of a type of noise
+                    self.noise_db_ranges[idx][0],  # min db
+                    self.noise_db_ranges[idx][1],  # max db
+                )
+                noiselist.append(noise)
+            noise = np.sum(np.concatenate(noiselist, axis=0), axis=0, keepdims=True)
+            speech = speech + noise
+
+        speech = np.squeeze(speech, axis=0)
+        return speech
+
+    def _text_process(
+        self, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, np.ndarray]:
+        """Make speaker labels into integers."""
+        if self.train:
+            int_label = self.spk2label[data["spk_labels"]]
+            data["spk_labels"] = np.asarray([int_label], dtype=np.int64)
+        else:
+            data["spk_labels"] = np.asarray([int(data["spk_labels"])])
+
+        if "task_tokens" in data:
+            data["task_tokens"] = np.asarray([int(data["task_tokens"])])
+
+        return data
+
+    @typechecked
+    def __call__(
+        self, uid: str, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, np.ndarray]:
+
+        data = self._text_process(data)
+        data = self._speech_process(data)
+
+        return data
+
+# install g729a
+'''
+$ git clone https://github.com/AlexIII/g729a-python.git
+$ echo > g729a-python/python/__init__.py
+$ cd g729a-python/src/
+$ make
+$ cp libg729a.so  ../python
+$ cd ../..
+$ vim g729a-python/python/g729a.py:
+    L6: current_file = os.path.abspath(__file__)  # absolute path
+    L7: current_dir = os.path.dirname(current_file)
+    L14: g729a_lib_path = current_dir + '/libg729a.so'
+'''
+
+import sys
+import os
+sys.path.append(os.path.dirname("../../tools/g729a-python/python/g729a"))
+g729a = __import__("g729a")
+
+class SpkPreprocessorTelephone(CommonPreprocessor):
+    """Preprocessor for Speaker tasks.
+
+    Args:
+        train (bool): Whether to use in training mode.
+        spk2utt (str): Path to the `spk2utt` file.
+        target_duration (float): Target duration in seconds.
+        sample_rate (int): Sampling rate.
+        num_eval (int): Number of utterances to be used for evaluation.
+        rir_scp (str): Path to the RIR scp file.
+        rir_apply_prob (float): Probability of applying RIR.
+        noise_info (List[Tuple[float, str, Tuple[int, int], Tuple[float, float]]]):
+            List of tuples of noise information. Each tuple represents a noise type.
+            Each tuple consists of `(prob, noise_scp, num_to_mix, db_range)`.
+                - `prob` (float) is the probability of applying the noise type.
+                - `noise_scp` (str) is the path to the noise scp file.
+                - `num_to_mix` (Tuple[int, int]) is the range of the number of noises
+                    to be mixed.
+                - `db_range` (Tuple[float, float]) is the range of noise levels in dB.
+        noise_apply_prob (float): Probability of applying noise.
+        short_noise_thres (float): Threshold of short noise.
+    """
+
+    def __init__(
+        self,
+        train: bool,
+        target_duration: float,  # in seconds
+        spk2utt: Optional[str] = None,
+        sample_rate: int = 16000,
+        num_eval: int = 10,
+        rir_scp: Optional[str] = None,
+        rir_apply_prob: float = 1.0,
+        noise_info: List[
+            Tuple[float, str, Tuple[int, int], Tuple[float, float]]
+        ] = None,
+        noise_apply_prob: float = 1.0,
+        short_noise_thres: float = 0.5,
+    ):
+
+        self.train = train
+
+        if rir_apply_prob == 0:
+            self.rir_scp = None
+        else:
+            self.rir_scp = rir_scp
+        super().__init__(train, rir_scp=self.rir_scp, rir_apply_prob=rir_apply_prob)
+
+        self.spk2label = None  # a dictionary that maps string speaker label to int
+        self.sample_rate = sample_rate
+        self.target_duration = int(target_duration * sample_rate)
+        self.num_eval = num_eval
+
+        if train:
+            with open(spk2utt, "r") as f_s2u:
+                self.spk2utt = f_s2u.readlines()
+            self._make_label_mapping()
+            self.nspk = len(self.spk2utt)
+
+        self.noise_apply_prob = noise_apply_prob
+        self.short_noise_thres = short_noise_thres
+        self.noises = []
+        self.noise_probs = []
+        self.noise_db_ranges = []
+        self.noise_num_to_mix = []
+        if noise_apply_prob > 0:
+            for prob, noise_scp, num_to_mix, db_range in noise_info:
+                if prob > 0:
+                    assert len(db_range) == 2, db_range
+                    assert db_range[0] <= db_range[1], db_range
+                    assert len(num_to_mix) == 2, num_to_mix
+                    assert num_to_mix[0] <= num_to_mix[1], num_to_mix
+                    self.noise_probs.append(prob)
+                    self.noise_db_ranges.append(tuple(db_range))
+                    self.noise_num_to_mix.append(num_to_mix)
+                    noises = []
+                    with open(noise_scp, "r", encoding="utf-8") as f:
+                        for line in f:
+                            sps = line.strip().split(None, 1)
+                            if len(sps) == 1:
+                                noises.append(sps[0])
+                            else:
+                                noises.append(sps[1])
+                    self.noises.append(noises)
+        
+        # Band Filtering
+        #######################################################################
+        self.filter_types = ["butter", "cheby1", "cheby2", "bessel", "ellip"]
+        self.ftype_probs = [0.25, 0.15, 0.30, 0.10, 0.20] # probability of selecting each filter
+        self.ripples=[0.5,3] # min and max ripples for cheby1
+        self.attenuations=[40,60] # min and max minimum attenuation in stopband for cheby2
+        self.MAX_LOW_CUT_FREQ=400 # maximum low frequency cut
+        self.MIN_HIGH_CUT_FREQ=3300 # minimum high frequency cut
+        self.NYQUIST_FREQ=self.fs/2
+
+        self.low_cut_frequencies_prob = {"0": 0.1, "mid": 0.5, str(self.MAX_LOW_CUT_FREQ):1}
+        self.high_cut_frequencies_prob = {str(self.MIN_HIGH_CUT_FREQ): 0.5, "mid": 0.9, str(int(self.NYQUIST_FREQ)):1}
+        
+        #torchaudio AudioEffector formats: ogg, wav, mp3, g722
+        #torchaudio AudioEffector codecs: vorbis (ogg), opus (ogg), pcm_mulaw (wav), pcm_alaw (wav), 
+        self.codecs=["g711a", "g711u", "wav", "g722", "opus", "g729a", "gsmfr","amrnb"]
+        #self.codecs=["opus", "vorbis", "mp3", "wav"]
+        # opus
+        self.opus_config={'frame_duration': [10,20], 'applications':['voip','audio','lowdelay'], 'bit_rates':[6000,16000], 'vbr': [0,1,2], 'vbr_constraint': [True,False], 'complexity':np.array([1, 1, 10, 10, 1000, 1000, 1000, 100, 100, 100, 100]), 'packet_loss':np.array([1000, 1000, 100, 100, 100, 100, 10, 10, 10, 1, 1]), 'fec': True, 'frame_size': 160}
+
+        # g729a
+        self.g729a_coder = g729a.G729Aencoder()
+        self.g729a_decoder = g729a.G729Adecoder()
+        self.g729a_samples_in_frame=self.g729a_coder.SAMPLES_IN_FRAME
+        
+        #amrnb
+        self.amrnb_bitrates=["4.75k", "5.15k", "5.90k", "6.70k", "7.40k", "7.95k", "10.20k", "12.20k"]
+        self.amrnb_dtx=["0","1"]
+    
+    def _apply_bandpass_filter(self, X: np.ndarray, Xm: np.ndarray):
+        # Simulate transmission
+        # get low cut frequency
+        lowcut_p=np.random.uniform(0,1)
+        if lowcut_p <= self.low_cut_frequencies_prob["0"]:
+            lowcut = 0
+        elif lowcut_p <= self.low_cut_frequencies_prob["mid"]:
+            lowcut = np.random.beta(1.3,1) * self.MAX_LOW_CUT_FREQ
+        elif lowcut_p <= self.low_cut_frequencies_prob[str(self.MAX_LOW_CUT_FREQ)]:
+            lowcut=self.MAX_LOW_CUT_FREQ
+        else:
+            raise ValueError(f"Probability for low cut frequency must be between 0-1 (got {lowcut}). Ranges are {self.low_cut_frequencies_prob}")
+            
+        # get high cut freq
+        highcut_p=np.random.uniform(0,1)
+        if highcut_p <= self.high_cut_frequencies_prob[str(self.MIN_HIGH_CUT_FREQ)]:
+            highcut = self.MIN_HIGH_CUT_FREQ
+        elif highcut_p <= self.high_cut_frequencies_prob["mid"]:
+            highcut = self.MIN_HIGH_CUT_FREQ + np.random.beta(1,1.3) * (self.NYQUIST_FREQ-self.MIN_HIGH_CUT_FREQ) # note we have reversed beta distribution
+        elif highcut_p <= self.high_cut_frequencies_prob[str(int(self.NYQUIST_FREQ))]:
+            highcut=self.NYQUIST_FREQ
+        else:
+            raise ValueError(f"Probability for high cut frequency must be between 0-1 (got {highcut}). Ranges are {self.high_cut_frequencies_prob}")
+        
+        # print(f"{utt_id} {lowcut}-{highcut}")
+        filter_type=np.random.choice(self.filter_types, p=self.ftype_probs)
+        
+        ripple=np.random.uniform(self.ripples[0],self.ripples[1])
+        atts=np.random.uniform(self.attenuations[0],self.attenuations[1])
+        
+        do_simulate_tx=True
+        # print(f"low {lowcut} high {highcut} fs {self.fs}")
+        if lowcut != 0 and highcut != self.NYQUIST_FREQ:
+            btype='bandpass'
+            wn=[lowcut,highcut]
+            assert(highcut>lowcut)
+        elif highcut != self.NYQUIST_FREQ:
+            # low pass
+            btype='lowpass'
+            wn=highcut
+        elif lowcut != 0:
+            # low pass
+            btype='highpass'
+            wn=lowcut
+        elif lowcut==0 and highcut==self.NYQUIST_FREQ:
+            do_simulate_tx=False
+        else:
+            raise ValueError(f"Wrong filtering frequncies low={lowcut} high={highcut}")
+
+        if do_simulate_tx:
+            # print(f"{utt_id} {btype}-{wn} {filter_type} {ripple} {atts}")
+            sos = design_filter(btype, wn, self.fs, filter_type, order=6, ripple=ripple, stopband_atts=atts)
+            X = apply_filter(X, sos) 
+            Xm = apply_filter(Xm, sos)    
+        
+        return X, Xm    
+
+
+    def _apply_codec(self, X: np.ndarray, Xm: np.ndarray, codec:str) -> Tuple[np.ndarray, np.ndarray] :
+        """Apply telephone codec
+
+        Args:
+            X (np.ndarray): clean input signal
+            Xm (np.ndarray): Noisy input signal
+            codec (str): telephone code
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: Encoded clean signal, encoded noisy signal
+        """
+        if codec=="wav":
+            pass
+        elif codec=="g711a":
+            effector = AudioEffector(format="wav", encoder="pcm_alaw")
+            X = np.array(X).copy()
+            Xm = np.array(Xm).copy()
+            X=torch.tensor(X).unsqueeze(1)
+            
+            Xm=torch.tensor(Xm).unsqueeze(1)
+            
+            X = effector.apply(X, self.fs)
+            Xm = effector.apply(Xm, self.fs)
+            X=X.squeeze().numpy()
+            Xm=Xm.squeeze().numpy()
+        elif codec=="g711u":
+            X = np.array(X).copy()
+            Xm = np.array(Xm).copy()
+            X=torch.tensor(X).unsqueeze(1)
+            Xm=torch.tensor(Xm).unsqueeze(1)
+            
+            effector = AudioEffector(format="wav", encoder="pcm_mulaw")
+            X = effector.apply(X, self.fs)
+            Xm = effector.apply(Xm, self.fs)
+            X=X.squeeze().numpy()
+            Xm=Xm.squeeze().numpy()
+        elif codec=="g722":
+            X = np.array(X).copy()
+            Xm = np.array(Xm).copy()
+            X=torch.tensor(X).unsqueeze(1)
+            Xm=torch.tensor(Xm).unsqueeze(1)
+            
+            effector = AudioEffector(format="g722")
+            X = effector.apply(X, self.fs)
+            Xm = effector.apply(Xm, self.fs)
+            X=X.squeeze().numpy()
+            Xm=Xm.squeeze().numpy()
+        elif codec=="opus":
+            ffmpeg_command = [
+                'ffmpeg',
+                '-f', 's16le',               # Input format: 16-bit signed little-endian PCM
+                '-ar', str(self.fs),     # Sample rate (e.g., 16000 Hz)
+                '-ac', '1',                  # 1 channel (mono)
+                '-i', 'pipe:0',              # Input comes from stdin (pipe:0)
+                '-c:a', 'libopus',           # Use libopus codec
+                '-b:a', str(np.random.uniform(self.opus_config['bit_rates'][0],self.opus_config['bit_rates'][1])),             # Bitrate: 12 kbps
+                '-vbr', str(np.random.choice(self.opus_config['vbr'])), 
+                '-fec', str(self.opus_config['fec']),                 # Enable Forward Error Correction
+                '-application', self.opus_config['applications'][0],
+                '-frame_duration', str(np.random.choice(self.opus_config['frame_duration'])),  
+                '-packet_loss', str(np.random.choice(np.arange(0, len(self.opus_config['packet_loss'])), size=1, p=self.opus_config['packet_loss']/self.opus_config['packet_loss'].sum())[0]),
+                '-f', 'opus',                # Explicitly specify output format for pipe
+                'pipe:1'                     # Output to stdout (pipe:1)
+            ]
+            
+            X = (X * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                opusdata, opusstderr = process.communicate(input=X)
+            
+            Xm = (Xm * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                opusdatam, opusstderrm = process.communicate(input=Xm)
+            
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', 'pipe:0',           # Input comes from stdin (pipe:0)
+                '-f', 's16le',             # Output format: 16-bit signed little-endian PCM
+                '-ar', str(self.fs),            # Output sample rate (16 kHz)
+                '-ac', '1',                # 1 channel (mono)
+                'pipe:1'                   # Output to stdout (pipe:1)
+            ]
+            
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdout, wavstderr = process.communicate(input=opusdata)
+            X = np.frombuffer(wavstdout, dtype=np.int16)
+            X = X.astype(np.float32) / 32768.0
+            del opusdata, opusstderr, wavstdout, wavstderr
+            
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdoutm, wavstderrm = process.communicate(input=opusdatam)
+            Xm = np.frombuffer(wavstdoutm, dtype=np.int16)
+            Xm = Xm.astype(np.float32) / 32768.0
+            del opusdatam, opusstderrm, wavstdoutm, wavstderrm
+        elif codec=="g729a":
+            X = (X * 32768).astype(np.int16)
+            step=self.g729a_samples_in_frame
+            Nframes=np.floor(len(X)/step).astype(np.int16) # *2 because we have two bytes per int16
+            
+            out=[]
+            for i in range(Nframes):
+                buff=X[i*step:(i+1)*step] # we advance int16 data type, so every index i covers 2 bytes, and therefore we only have to go to 160/2
+                gdata=self.g729a_coder.process(bytearray(buff))
+                out.append(self.g729a_decoder.process(gdata))
+            out=b''.join(out)  
+            out=np.frombuffer(out,np.int16)
+            X = out.astype(np.float32) / 32768.0 
+            del out, gdata
+
+            Xm = (Xm * 32768).astype(np.int16)
+            Nframes=np.floor(len(Xm)/step).astype(np.int16) # *2 because we have two bytes per int16
+            
+            out=[]
+            for i in range(Nframes):
+                buff=Xm[i*step:(i+1)*step] # we advance int16 data type, so every index i covers 2 bytes, and therefore we only have to go to 160/2
+                gdata=self.g729a_coder.process(bytearray(buff))
+                out.append(self.g729a_decoder.process(gdata))
+            out=b''.join(out)  
+            out=np.frombuffer(out,np.int16)
+            Xm = out.astype(np.float32) / 32768.0 
+            del out, gdata
+        elif codec=="gsmfr":
+            sox_command = [
+                'sox',                  # 1 channel (mono)
+                '-t', 'raw',
+                '-b','16',
+                '-e','signed-integer',
+                '-r', str(self.fs),
+                '-',              # Input comes from stdin (pipe:0)
+                '-e', 'gsm-full-rate',
+                '-t', 'gsm',                # Explicitly specify output format for pipe
+                '-'                     # Output to stdout (pipe:1)
+            ]
+            
+            X = (X * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(sox_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                gsmfrdata, gsmfrstderr = process.communicate(input=X)
+                
+            Xm = (Xm * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(sox_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                gsmfrdatam, gsmfrstderrm = process.communicate(input=Xm)
+                
+                
+            sox_command = [
+                'sox',                  # 1 channel (mono)
+                '-t', 'gsm',
+                '-e', 'gsm-full-rate',
+                '-',
+                '-b','16',
+                '-r', str(self.fs),
+                '-e','signed-integer',
+                '-t', 'raw',                # Explicitly specify output format for pipe
+                '-'                     # Output to stdout (pipe:1)
+            ]
+            
+                
+            with subprocess.Popen(sox_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdout, wavstderr = process.communicate(input=gsmfrdata)
+                
+            X = np.frombuffer(wavstdout, dtype=np.int16)
+            X = X.astype(np.float32) / 32768.0
+            del gsmfrdata, gsmfrstderr, wavstdout, wavstderr
+            
+            with subprocess.Popen(sox_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdoutm, wavstderrm = process.communicate(input=gsmfrdatam)
+                
+            Xm = np.frombuffer(wavstdoutm, dtype=np.int16)
+            Xm = Xm.astype(np.float32) / 32768.0
+            del gsmfrdatam, gsmfrstderrm, wavstdoutm, wavstderrm
+            
+        elif codec=='amrnb':
+            bitrate=np.random.choice(self.amrnb_bitrates)
+            dtx=np.random.choice(self.amrnb_dtx)
+            ffmpeg_command = [
+                'ffmpeg',
+                '-f', 's16le',               # Input format: 16-bit signed little-endian PCM
+                '-ar', str(self.fs),     # Sample rate (e.g., 16000 Hz)
+                '-ac', '1',                  # 1 channel (mono)
+                '-i', 'pipe:0',              # Input comes from stdin (pipe:0)
+                '-c:a', 'libopencore_amrnb',           # Use libopus codec
+                '-b:a', bitrate,             # Bitrate: 12 kbps
+                '-dtx', dtx,
+                '-f', 'amr',
+                'pipe:1'                     # Output to stdout (pipe:1)
+            ]
+
+            X = (X * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                amrdata, amrstderr = process.communicate(input=X)
+            
+            Xm = (Xm * 32768).astype(np.int16).tobytes()
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                amrdatam, amrstderrm = process.communicate(input=Xm)
+            
+            ffmpeg_command = [
+                'ffmpeg',
+                '-f','amr',
+                '-c:a', 'libopencore_amrnb', 
+                '-i', 'pipe:0',           # Input comes from stdin (pipe:0)
+                '-f', 's16le',             # Output format: 16-bit signed little-endian PCM
+                '-ar', str(self.fs),            # Output sample rate (16 kHz)
+                '-ac', '1',                # 1 channel (mono)
+                'pipe:1'                   # Output to stdout (pipe:1)
+            ]
+            
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdout, wavstderr = process.communicate(input=amrdata)
+            X = np.frombuffer(wavstdout, dtype=np.int16)
+            X = X.astype(np.float32) / 32768.0
+            del amrdata, amrstderr, wavstdout, wavstderr
+            
+            with subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                wavstdoutm, wavstderrm = process.communicate(input=amrdatam)
+            Xm = np.frombuffer(wavstdoutm, dtype=np.int16)
+            Xm = Xm.astype(np.float32) / 32768.0
+            del amrdatam, amrstderrm, wavstdoutm, wavstderrm
+        return X, Xm
+                     
 
     def __repr__(self):
         name = self.__class__.__module__ + "." + self.__class__.__name__
